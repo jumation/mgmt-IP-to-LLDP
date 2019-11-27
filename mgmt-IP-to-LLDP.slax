@@ -1,0 +1,223 @@
+/*
+ * Title               : mgmt-IP-to-LLDP
+ * Last modified date  : 27.11.2019
+ * Author              : jumation.com
+ * Description         : Advertises IPv4 or IPv6 address on in-band
+ *                       management IRB interface in LLDP(TLV 8).
+ * Options             :
+ * Notes               : Requires Junos 12.2 or newer.
+ *                       Event policy is embedded in the script.
+ */
+
+version 1.1;
+
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+
+import "../import/junos.xsl";
+
+
+var $event-definition = {
+	<event-options> {
+		<generate-event> {
+			<name> "every_minute";
+			<time-interval> "60";
+			<no-drift>;
+		}
+		<policy> {
+			<name> "mgmt-IP-to-LLDP";
+			<events> "every_minute";
+			<then> {
+				<event-script> {
+					<name> "mgmt-IP-to-LLDP.slax";
+				}
+			}
+		}
+	}
+}
+
+
+template configure($con, $irb_ip, $lldp_mgmt_ip) {
+
+	var $rpc-lock-config = {
+		<lock> {
+			<target> {
+				<candidate>;
+			}
+		}
+	}
+
+	var $rpc-unlock-config = {
+		<unlock> {
+			<target> {
+				<candidate>;
+			}
+		}
+	}
+
+	var $rpc-commit = {
+		<commit-configuration> {
+			if($irb_ip && $lldp_mgmt_ip) {
+				<log> "! LLDP management address " _
+						"by " _ $script;
+			}
+			else if ($irb_ip) {
+				<log> "+ LLDP management address " _
+						"by " _ $script;
+			}
+			else {
+				<log> "- LLDP management address " _
+						"by " _ $script;
+			}
+		}
+	}
+
+
+	var $comment = "/* LLDP management address configured by " _ $script _
+											" / " _ $localtime-iso _ " */";
+
+	var $rpc-edit-config = {
+		<edit-config> {
+			<target> {
+				<candidate>;
+			}
+			<config> {
+				<configuration> {
+					<protocols> {
+						<lldp> {
+							if($irb_ip) {
+								<junos:comment> $comment;
+								<management-address operation="replace"> $irb_ip;
+							}
+							else {
+								<management-address delete="delete">;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	var $config-results := {
+
+		/*
+		 * Lock the candidate configuration.
+		 * Uncommitted changes will be discarded on exit.
+		 */
+		var $lock-reply = jcs:execute($con, $rpc-lock-config);
+
+		if ($lock-reply//self::xnm:error) {
+			copy-of $lock-reply;
+		}
+		else {
+			var $edit-config-reply = jcs:execute($con, $rpc-edit-config);
+
+			if ($edit-config-reply//self::xnm:error) {
+				copy-of $edit-config-reply;
+			}
+			else {
+				var $commit-reply = jcs:execute($con, $rpc-commit);
+				copy-of $commit-reply;
+			}
+			expr jcs:execute($con, $rpc-unlock-config);
+		}
+	}
+
+	if ($config-results//xnm:error) {
+		call exit($msg = $config-results//xnm:error/message);
+	}
+}
+
+
+template exit($slvl = "error", $msg) {
+
+	expr jcs:syslog("external." _ $slvl, $script _ ": ", $msg);
+	terminate;
+
+}
+
+
+match / {
+	<event-script-results> {
+
+		var $con = jcs:open();
+
+		if (not($con)) {
+			call exit($msg = "Unable to connect to local mgd");
+		}
+
+		/*
+		 * An alternative approach would be to use <get-lldp-local-info>
+		 * RPC, but as LLDP mgmt address defaults to IP address of the
+		 * switch me/vme interface, then this can cause a situation where
+		 * LLDP mgmt address is present while none of the IRB IFLs have an
+		 * address present and thus the script would try to remove the
+		 * non-existing "management-address" configuration statement under
+		 * "[edit protocols lldp]". One could check the content of the
+		 * configuration diff before the commit, make a rollback and cancel
+		 * the commit if the diff is empty, but checking the LLDP configuration
+		 * in the first place seems to be a cleaner solution.
+		 */
+		var $lldp_conf_rpc = {
+			<get-configuration database="committed" inherit="inherit"> {
+				<configuration> {
+					<protocols> {
+						<lldp> {
+							<management-address>;
+						}
+					}
+				}
+			}
+		}
+		var $lldp_conf = jcs:execute($con, $lldp_conf_rpc);
+
+		if ( $lldp_conf/../xnm:error ) {
+			var $msg = "Error executing <get-configuration> RPC";
+			call exit($msg);
+		}
+
+
+		/* Finds the IFLs of IRB interface. */
+		var $ints_info_rpc = {
+			<get-interface-information> {
+				<terse>;
+				<interface-name> "irb.*";
+			}
+		}
+		var $ints_info = jcs:execute($con, $ints_info_rpc);
+
+		if ( $ints_info/../xnm:error ) {
+			var $msg = "Error executing <get-interface-information> RPC";
+			call exit($msg);
+		}
+
+
+		/* Selects the first IPv4 or IPv6 network. */
+		var $irb_net = $ints_info/logical-interface/address-family
+							[address-family-name == "inet" ||
+							address-family-name == "inet6"]/interface-address/
+							ifa-local;
+
+
+		var $irb_ip_ns := {
+			if (contains($irb_net, "/")) {
+				expr substring-before($irb_net, "/");
+			}
+			else {
+				expr $irb_net;
+			}
+		}
+		var $irb_ip = string($irb_ip_ns);
+
+		var $lldp_mgmt_ip = $lldp_conf//management-address;
+
+
+		if ((not($irb_ip) && $lldp_mgmt_ip) || ($irb_ip && not($lldp_mgmt_ip))
+												|| ($irb_ip != $lldp_mgmt_ip)) {
+			call configure($con, $irb_ip, $lldp_mgmt_ip);
+		}
+
+	}
+}
